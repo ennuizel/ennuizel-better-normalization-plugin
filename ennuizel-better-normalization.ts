@@ -69,6 +69,7 @@ async function load() {
 async function uiNormalize(d: ennuizel.ui.Dialog) {
     // Currently no options
     await Ennuizel.ui.loading(async function(d) {
+        Ennuizel.undoPoint();
         await betterNormalize(Object.create(null), Ennuizel.select.getSelection(), d);
     }, {
         reuse: d
