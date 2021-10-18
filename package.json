@@ -1,0 +1,22 @@
+{
+  "name": "ennuizel-better-normalization-plugin",
+  "version": "1.0.0",
+  "description": "A better normalization plugin for Ennuizel. Still uses dynaudnorm, just in a more intelligent way.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ennuizel/ennuizel-better-normalization-plugin.git"
+  },
+  "author": "Yahweasel",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/ennuizel/ennuizel-better-normalization-plugin/issues"
+  },
+  "homepage": "https://github.com/ennuizel/ennuizel-better-normalization-plugin#readme",
+  "dependencies": {
+    "typescript": "^4.4.4"
+  }
+}
