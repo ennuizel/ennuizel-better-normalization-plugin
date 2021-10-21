@@ -70,7 +70,11 @@ async function uiNormalize(d: ennuizel.ui.Dialog) {
     // Currently no options
     await Ennuizel.ui.loading(async function(d) {
         Ennuizel.undoPoint();
-        await betterNormalize(Object.create(null), Ennuizel.select.getSelection(), d);
+        await Ennuizel.filters.selectionFilter(
+            x => betterNormalize(x), false,
+            Ennuizel.select.getSelection(),
+            d
+        );
     }, {
         reuse: d
     });
@@ -78,31 +82,13 @@ async function uiNormalize(d: ennuizel.ui.Dialog) {
 
 /**
  * Filter implementation.
- * @param opts  dynaudnorm options.
- * @param sel  Selection to filter.
- * @param d  Dialog to show progress.
+ * @param stream  Input stream to filter.
+ * @param opts  Other dynaudnorm options.
  */
 async function betterNormalize(
-    opts: Record<string, string>, sel: ennuizel.select.Selection,
-    d: ennuizel.ui.Dialog
-) {
-    // Get the audio tracks
-    let tracks = <ennuizel.track.AudioTrack[]>
-        sel.tracks.filter(x => x.type() === Ennuizel.TrackType.Audio);
-    tracks = tracks.filter(x => x.duration() !== 0);
-
-    if (tracks.length === 0)
-        return;
-
-    if (d)
-        d.box.innerHTML = "Filtering...";
-
-    // Make the stream options
-    const streamOpts = {
-        start: sel.range ? sel.start : void 0,
-        end: sel.range ? sel.end : void 0
-    };
-
+    stream: ennuizel.EZStream<ennuizel.LibAVFrame>,
+    opts: Record<string, string> = {}
+): Promise<ReadableStream<ennuizel.LibAVFrame>> {
     // Make the filter string
     let fs = "dynaudnorm";
     if (Object.keys(opts).length) {
@@ -114,127 +100,72 @@ async function betterNormalize(
     }
     fs += ",atrim=start=10";
 
-    // Make the status
-    const status = tracks.map(x => ({
-        name: x.name,
-        filtered: 0,
-        duration: x.sampleCount()
-    }));
-
-    // Function to show the current status
-    function showStatus() {
-        if (d) {
-            const statusStr = status.map(x =>
-                x.name + ": " + Math.round(x.filtered / x.duration * 100) + "%")
-            .join("<br/>");
-            d.box.innerHTML = "Filtering...<br/>" + statusStr;
-        }
-    }
-
-    // The filtering function for each track
-    async function filterThread(track: ennuizel.track.AudioTrack, idx: number) {
-        // Make a libav instance
-        const libav = await LibAV.LibAV();
-
-        // Make our filter
-        const channelLayout = (track.channels === 1) ? 4 : ((1<<track.channels)-1);
-        const frame = await libav.av_frame_alloc();
-        const [, src, sink] =
-            await libav.ff_init_filter_graph(fs, {
-                sample_rate: track.sampleRate,
-                sample_fmt: track.format,
-                channel_layout: channelLayout
-            }, {
-                sample_rate: track.sampleRate,
-                sample_fmt: track.format,
-                channel_layout: channelLayout
-            });
-
-        // Pre-padding input stream
-        let preInStream = track.stream(streamOpts).getReader();
-
-        // Get 10 seconds of data through the filter for normalization
-        let remaining = 10 * track.sampleRate * track.channels;
-        while (remaining) {
-            const rd = await preInStream.read();
-            if (rd.done) {
-                // Try again from the start
-                preInStream = track.stream(streamOpts).getReader();
-            } else {
-                rd.value.node = null;
-                if (rd.value.data.length > remaining)
-                    rd.value.data = rd.value.data.subarray(0, remaining);
-                await libav.ff_filter_multi(src, sink, frame, [rd.value], false)
-                remaining -= rd.value.data.length;
-            }
-        }
-        preInStream.cancel();
-
-        // Input stream
-        const inStream = track.stream(Object.assign({keepOpen: true}, streamOpts)).getReader();
-
-        // Filter stream
-        const filterStream = new Ennuizel.ReadableStream({
-            async pull(controller) {
-                while (true) {
-                    // Get some data
-                    const inp = await inStream.read();
-                    if (inp.value)
-                        inp.value.node = null;
-
-                    // Filter
-                    const outp = await libav.ff_filter_multi(
-                        src, sink, frame,
-                        inp.done ? [] : [inp.value], inp.done);
-
-                    // Update the status
-                    if (inp.done)
-                        status[idx].filtered = status[idx].duration;
-                    else
-                        status[idx].filtered += inp.value.data.length;
-                    showStatus();
-
-                    // Write it out
-                    for (const part of outp)
-                        controller.enqueue(part.data);
-
-                    // Maybe end it
-                    if (inp.done)
-                        controller.close();
-
-                    if (outp.length || inp.done)
-                        break;
-                }
+    // Get the first data to know statistics
+    const first = await stream.read();
+    if (!first) {
+        // Oh well!
+        return new Ennuizel.ReadableStream({
+            start(controller) {
+                controller.close();
             }
         });
-
-        // Overwrite the track
-        await track.overwrite(filterStream, Object.assign({closeTwice: true}, streamOpts));
-
-        // And get rid of the libav instance
-        libav.terminate();
     }
+    stream.push(first);
 
-    // Number of threads to run at once
-    const threads = navigator.hardwareConcurrency ? navigator.hardwareConcurrency : 2;
+    // Make an input stream that duplicates the first ten seconds of data
+    let remaining = 10 * first.sample_rate * first.channels;
+    let recycle: ennuizel.LibAVFrame[] = [];
+    const inputStream = new Ennuizel.ReadableStream({
+        async pull(controller) {
+            if (remaining > 0) {
+                // We're still getting initial data
+                let chunk: ennuizel.LibAVFrame = null;
+                while (!chunk) {
+                    chunk = await stream.read();
+                    if (!chunk) {
+                        // Early recycling!
+                        while (recycle.length)
+                            stream.push(recycle.pop());
+                    }
+                }
 
-    // Current state
-    const running: Promise<unknown>[] = [];
-    const toRun = tracks.map((x, idx) => <[ennuizel.track.AudioTrack, number]> [x, idx]);
+                recycle.push(chunk);
 
-    // Run
-    while (toRun.length) {
-        // Get the right number of threads running
-        while (running.length < threads && toRun.length) {
-            const [sel, idx] = toRun.shift();
-            running.push(filterThread(sel, idx));
+                if (chunk.data.length > remaining) {
+                    // Send as much as is needed
+                    const nchunk = Object.assign({}, chunk);
+                    nchunk.data = nchunk.data.subarray(0, remaining);
+                    controller.enqueue(nchunk);
+                    remaining = 0;
+
+                } else {
+                    // Send this whole chunk
+                    controller.enqueue(chunk);
+                    remaining -= chunk.data.length;
+
+                }
+
+                // Perhaps done with initial data?
+                if (remaining === 0) {
+                    while (recycle.length)
+                        stream.push(recycle.pop());
+                }
+
+            } else {
+                // Just sending normal data
+                const chunk = await stream.read();
+                if (chunk)
+                    controller.enqueue(chunk);
+                else
+                    controller.close();
+
+            }
         }
+    });
 
-        // Wait for one to finish to make room for more
-        const fin = await Promise.race(running.map((x, idx) => x.then(() => idx)));
-        running.splice(fin, 1);
-    }
+    // Feed *that* to the filter
+    const filterStream = await Ennuizel.filters.ffmpegStream(
+        new Ennuizel.EZStream(inputStream), fs);
 
-    // Wait for them all to finish
-    await Promise.all(running);
+    return filterStream;
 }
